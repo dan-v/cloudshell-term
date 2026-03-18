@@ -7,12 +7,19 @@ $ cloudshell-term us-west-2
 Connecting to CloudShell in us-west-2...
 Connected.
 
-cloudshell-user@ip-10-132-74-210 ~ $
+cloudshell-user@ip-10-132-74-210 ~ $ aws sts get-caller-identity
+{
+    "UserId": "AIDAEXAMPLE",
+    "Account": "123456789012",
+    "Arn": "arn:aws:iam::123456789012:user/myuser"
+}
 ```
 
 ## What it does
 
 Opens an interactive shell session to an AWS CloudShell environment using the internal CloudShell API (reverse engineered — no public API exists). Handles environment creation, startup from suspended state, session management, and heartbeats to keep the environment alive.
+
+Your local AWS credentials are automatically injected into the CloudShell session so the AWS CLI and SDKs work out of the box.
 
 Supports both standard CloudShell environments (with persistent ~1GB storage) and VPC environments (ephemeral, but with access to private VPC resources).
 

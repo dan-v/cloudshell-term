@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -34,7 +35,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/google/uuid"
+	"github.com/mmmorris1975/ssm-session-client/datachannel"
 )
 
 // ---- CloudShell API client ----
@@ -195,6 +198,7 @@ type flags struct {
 	vpc    string
 	subnet string
 	sg     []string
+	awsCfg aws.Config
 }
 
 func parseFlags() flags {
@@ -277,6 +281,7 @@ func run(ctx context.Context, f flags) error {
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w", err)
 	}
+	f.awsCfg = cfg
 
 	client := newCSClient(cfg, f.region)
 
@@ -284,7 +289,6 @@ func run(ctx context.Context, f flags) error {
 	isVPC := f.vpc != ""
 
 	if isVPC {
-		// For VPC environments, always create a new one (they're ephemeral)
 		fmt.Fprintf(os.Stderr, "Creating VPC environment (vpc=%s, subnet=%s)...\n", f.vpc, f.subnet)
 		vpc := &vpcConfig{
 			VpcID:            f.vpc,
@@ -298,7 +302,6 @@ func run(ctx context.Context, f flags) error {
 		env = *created
 		fmt.Fprintf(os.Stderr, "VPC environment created: %s\n", env.EnvironmentID)
 	} else {
-		// Standard environment — find existing or create
 		envs, err := client.describeEnvironments(ctx)
 		if err != nil {
 			return fmt.Errorf("describe environments: %w", err)
@@ -312,7 +315,6 @@ func run(ctx context.Context, f flags) error {
 			}
 			env = *created
 		} else {
-			// Find a non-VPC environment
 			found := false
 			for _, e := range envs.Environments {
 				if e.VpcConfig == nil {
@@ -332,7 +334,6 @@ func run(ctx context.Context, f flags) error {
 		}
 	}
 
-	// Check status and start if needed
 	status := env.Status
 	if status == "" {
 		s, _ := client.getEnvironmentStatus(ctx, env.EnvironmentID)
@@ -366,20 +367,19 @@ func run(ctx context.Context, f flags) error {
 		}
 	}
 
-	// Create session
+	// Inject AWS credentials via a datachannel session so AWS CLI works
+	injectCredentials(ctx, f, client, env.EnvironmentID)
+
+	// Create session for the interactive plugin
 	sess, err := client.createSession(ctx, env.EnvironmentID)
 	if err != nil {
 		return fmt.Errorf("create session: %w", err)
 	}
 	defer client.deleteSession(context.Background(), env.EnvironmentID, sess.SessionID)
 
-	if isVPC {
-		fmt.Fprintf(os.Stderr, "Connected to VPC environment.\n\n")
-	} else {
-		fmt.Fprintf(os.Stderr, "Connected.\n\n")
-	}
+	fmt.Fprintf(os.Stderr, "Connected.\n\n")
 
-	// Heartbeat to keep environment alive
+	// Heartbeat
 	go func() {
 		ticker := time.NewTicker(4 * time.Minute)
 		defer ticker.Stop()
@@ -393,7 +393,7 @@ func run(ctx context.Context, f flags) error {
 		}
 	}()
 
-	// Launch session-manager-plugin with terminal connected directly
+	// Launch session-manager-plugin for interactive TTY
 	payload, _ := json.Marshal(map[string]string{
 		"SessionId":  sess.SessionID,
 		"TokenValue": sess.TokenValue,
@@ -413,4 +413,112 @@ func run(ctx context.Context, f flags) error {
 	}
 
 	return nil
+}
+
+// ---- Credential injection via datachannel ----
+// Opens a brief datachannel to the CloudShell tmux session, exports
+// AWS credentials as environment variables, then closes. The env vars
+// persist in the tmux session for the interactive plugin to use.
+
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]|\x0f`)
+
+func injectCredentials(ctx context.Context, f flags, client *csClient, envID string) {
+	creds, err := f.awsCfg.Credentials.Retrieve(ctx)
+	if err != nil || creds.AccessKeyID == "" {
+		return
+	}
+
+	// If using long-lived IAM keys (no session token), generate temporary
+	// credentials so we don't write permanent keys to disk in CloudShell.
+	if creds.SessionToken == "" {
+		stsClient := sts.NewFromConfig(f.awsCfg)
+		out, err := stsClient.GetSessionToken(ctx, &sts.GetSessionTokenInput{
+			DurationSeconds: aws.Int32(3600),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not generate temp credentials: %v\n", err)
+		} else if out.Credentials != nil {
+			creds.AccessKeyID = *out.Credentials.AccessKeyId
+			creds.SecretAccessKey = *out.Credentials.SecretAccessKey
+			creds.SessionToken = *out.Credentials.SessionToken
+		}
+	}
+
+	sess, err := client.createSession(ctx, envID)
+	if err != nil {
+		return
+	}
+	defer client.deleteSession(context.Background(), envID, sess.SessionID)
+
+	dc := new(datachannel.SsmDataChannel)
+	if err := dc.StartSessionFromDataChannelURL(sess.StreamURL, sess.TokenValue); err != nil {
+		return
+	}
+	defer dc.Close()
+
+	// Background reader
+	output := make(chan string, 100)
+	go func() {
+		buf := make([]byte, 8192)
+		for {
+			n, err := dc.Read(buf)
+			if err != nil {
+				close(output)
+				return
+			}
+			if n > 0 {
+				payload, _ := dc.HandleMsg(buf[:n])
+				if len(payload) > 0 {
+					output <- string(payload)
+				}
+			}
+		}
+	}()
+
+	dc.SetTerminalSize(24, 120)
+	waitForOutput(output, "$ ", 10*time.Second)
+
+	// Write credentials to a file readable only by the current user,
+	// and source it from .bashrc so they're available in all tmux panes.
+	// File is cleaned up on next connect (overwritten with fresh creds).
+	credFile := "/home/cloudshell-user/.cs-creds"
+
+	var lines []string
+	lines = append(lines, fmt.Sprintf("export AWS_ACCESS_KEY_ID=%s", creds.AccessKeyID))
+	lines = append(lines, fmt.Sprintf("export AWS_SECRET_ACCESS_KEY=%s", creds.SecretAccessKey))
+	lines = append(lines, fmt.Sprintf("export AWS_DEFAULT_REGION=%s", f.region))
+	if creds.SessionToken != "" {
+		lines = append(lines, fmt.Sprintf("export AWS_SESSION_TOKEN=%s", creds.SessionToken))
+	}
+
+	writeCmd := fmt.Sprintf("cat > %s << 'CEOF'\n%s\nCEOF\nchmod 600 %s\r", credFile, strings.Join(lines, "\n"), credFile)
+	dc.Write([]byte(writeCmd))
+	waitForOutput(output, "$ ", 5*time.Second)
+
+	sourceCmd := fmt.Sprintf("grep -q '%s' ~/.bashrc 2>/dev/null || echo '[ -f %s ] && source %s' >> ~/.bashrc\r", credFile, credFile, credFile)
+	dc.Write([]byte(sourceCmd))
+	waitForOutput(output, "$ ", 5*time.Second)
+
+	// Source in current session
+	dc.Write([]byte(fmt.Sprintf("source %s\r", credFile)))
+	waitForOutput(output, "$ ", 5*time.Second)
+}
+
+func waitForOutput(ch chan string, substr string, timeout time.Duration) {
+	dl := time.After(timeout)
+	var buf strings.Builder
+	for {
+		select {
+		case s, ok := <-ch:
+			if !ok {
+				return
+			}
+			buf.WriteString(s)
+			if strings.Contains(ansiRe.ReplaceAllString(buf.String(), ""), substr) {
+				return
+			}
+		case <-dl:
+			return
+		}
+	}
 }
