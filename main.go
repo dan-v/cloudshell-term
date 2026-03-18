@@ -291,7 +291,7 @@ func run(ctx context.Context, f flags) error {
 			SubnetIDs:        []string{f.subnet},
 			SecurityGroupIDs: f.sg,
 		}
-		created, err := client.createEnvironment(ctx, fmt.Sprintf("cloudshell-term-vpc-%s", f.vpc), vpc)
+		created, err := client.createEnvironment(ctx, fmt.Sprintf("cst-%s", uuid.NewString()[:8]), vpc)
 		if err != nil {
 			return fmt.Errorf("create VPC environment: %w", err)
 		}
