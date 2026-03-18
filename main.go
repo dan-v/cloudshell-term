@@ -2,11 +2,15 @@
 //
 // Usage:
 //
-//	cloudshell-term [region]
+//	cloudshell-term [flags] [region]
 //
 // Connects to an AWS CloudShell environment in the specified region
 // (defaults to AWS_DEFAULT_REGION or us-east-1) and gives you an
 // interactive terminal session. No AWS Console required.
+//
+// Supports VPC environments for accessing private resources:
+//
+//	cloudshell-term --vpc vpc-123 --subnet subnet-456 --sg sg-789 us-east-1
 //
 // Requires: AWS credentials and session-manager-plugin installed.
 package main
@@ -43,9 +47,17 @@ type csClient struct {
 	creds      aws.CredentialsProvider
 }
 
+type vpcConfig struct {
+	VpcID            string   `json:"VpcId"`
+	SubnetIDs        []string `json:"SubnetIds"`
+	SecurityGroupIDs []string `json:"SecurityGroupIds"`
+}
+
 type environment struct {
-	EnvironmentID string `json:"EnvironmentId"`
-	Status        string `json:"Status"`
+	EnvironmentID string     `json:"EnvironmentId"`
+	Name          string     `json:"EnvironmentName,omitempty"`
+	Status        string     `json:"Status"`
+	VpcConfig     *vpcConfig `json:"VpcConfig,omitempty"`
 }
 
 type describeOutput struct {
@@ -129,9 +141,13 @@ func (c *csClient) describeEnvironments(ctx context.Context) (*describeOutput, e
 	return &out, err
 }
 
-func (c *csClient) createEnvironment(ctx context.Context) (*environment, error) {
+func (c *csClient) createEnvironment(ctx context.Context, vpc *vpcConfig) (*environment, error) {
 	var out environment
-	err := c.do(ctx, "createEnvironment", struct{}{}, &out)
+	payload := map[string]any{}
+	if vpc != nil {
+		payload["VpcConfig"] = vpc
+	}
+	err := c.do(ctx, "createEnvironment", payload, &out)
 	return &out, err
 }
 
@@ -169,66 +185,148 @@ func (c *csClient) sendHeartbeat(ctx context.Context, envID string) error {
 	return c.do(ctx, "sendHeartBeat", map[string]string{"EnvironmentId": envID}, nil)
 }
 
+// ---- CLI flags ----
+
+type flags struct {
+	region string
+	vpc    string
+	subnet string
+	sg     []string
+}
+
+func parseFlags() flags {
+	f := flags{}
+	args := os.Args[1:]
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--help", "-h":
+			fmt.Println(`Usage: cloudshell-term [flags] [region]
+
+Opens an interactive AWS CloudShell terminal.
+
+Flags:
+  --vpc ID          VPC ID for VPC environment
+  --subnet ID       Subnet ID (requires --vpc)
+  --sg ID           Security group ID (repeatable, requires --vpc)
+  -h, --help        Show this help
+
+Region defaults to AWS_DEFAULT_REGION or us-east-1.
+
+Examples:
+  cloudshell-term
+  cloudshell-term eu-west-1
+  cloudshell-term --vpc vpc-abc --subnet subnet-def --sg sg-ghi us-east-1`)
+			os.Exit(0)
+		case "--vpc":
+			if i+1 < len(args) {
+				f.vpc = args[i+1]
+				i++
+			}
+		case "--subnet":
+			if i+1 < len(args) {
+				f.subnet = args[i+1]
+				i++
+			}
+		case "--sg":
+			if i+1 < len(args) {
+				f.sg = append(f.sg, args[i+1])
+				i++
+			}
+		default:
+			if !strings.HasPrefix(args[i], "-") {
+				f.region = args[i]
+			}
+		}
+	}
+
+	if f.region == "" {
+		f.region = os.Getenv("AWS_DEFAULT_REGION")
+	}
+	if f.region == "" {
+		f.region = os.Getenv("AWS_REGION")
+	}
+	if f.region == "" {
+		f.region = "us-east-1"
+	}
+
+	return f
+}
+
 // ---- Main ----
 
 func main() {
-	region := os.Getenv("AWS_DEFAULT_REGION")
-	if region == "" {
-		region = os.Getenv("AWS_REGION")
-	}
-	if region == "" {
-		region = "us-east-1"
-	}
-
-	if len(os.Args) > 1 {
-		arg := os.Args[1]
-		if arg == "--help" || arg == "-h" {
-			fmt.Println("Usage: cloudshell-term [region]")
-			fmt.Println()
-			fmt.Println("Opens an interactive AWS CloudShell terminal.")
-			fmt.Println("Defaults to AWS_DEFAULT_REGION or us-east-1.")
-			fmt.Println()
-			fmt.Println("Requires: AWS credentials and session-manager-plugin")
-			os.Exit(0)
-		}
-		region = arg
-	}
+	f := parseFlags()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, region); err != nil {
+	if err := run(ctx, f); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, region string) error {
-	fmt.Fprintf(os.Stderr, "Connecting to CloudShell in %s...\n", region)
+func run(ctx context.Context, f flags) error {
+	fmt.Fprintf(os.Stderr, "Connecting to CloudShell in %s...\n", f.region)
 
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(f.region))
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w", err)
 	}
 
-	client := newCSClient(cfg, region)
-
-	// Get or create environment
-	envs, err := client.describeEnvironments(ctx)
-	if err != nil {
-		return fmt.Errorf("describe environments: %w", err)
-	}
+	client := newCSClient(cfg, f.region)
 
 	var env environment
-	if len(envs.Environments) == 0 {
-		fmt.Fprintf(os.Stderr, "No environment found, creating...\n")
-		created, err := client.createEnvironment(ctx)
+	isVPC := f.vpc != ""
+
+	if isVPC {
+		// For VPC environments, always create a new one (they're ephemeral)
+		fmt.Fprintf(os.Stderr, "Creating VPC environment (vpc=%s, subnet=%s)...\n", f.vpc, f.subnet)
+		vpc := &vpcConfig{
+			VpcID:            f.vpc,
+			SubnetIDs:        []string{f.subnet},
+			SecurityGroupIDs: f.sg,
+		}
+		created, err := client.createEnvironment(ctx, vpc)
 		if err != nil {
-			return fmt.Errorf("create environment: %w", err)
+			return fmt.Errorf("create VPC environment: %w", err)
 		}
 		env = *created
+		fmt.Fprintf(os.Stderr, "VPC environment created: %s\n", env.EnvironmentID)
 	} else {
-		env = envs.Environments[0]
+		// Standard environment — find existing or create
+		envs, err := client.describeEnvironments(ctx)
+		if err != nil {
+			return fmt.Errorf("describe environments: %w", err)
+		}
+
+		if len(envs.Environments) == 0 {
+			fmt.Fprintf(os.Stderr, "No environment found, creating...\n")
+			created, err := client.createEnvironment(ctx, nil)
+			if err != nil {
+				return fmt.Errorf("create environment: %w", err)
+			}
+			env = *created
+		} else {
+			// Find a non-VPC environment
+			found := false
+			for _, e := range envs.Environments {
+				if e.VpcConfig == nil {
+					env = e
+					found = true
+					break
+				}
+			}
+			if !found {
+				fmt.Fprintf(os.Stderr, "No standard environment found, creating...\n")
+				created, err := client.createEnvironment(ctx, nil)
+				if err != nil {
+					return fmt.Errorf("create environment: %w", err)
+				}
+				env = *created
+			}
+		}
 	}
 
 	// Check status and start if needed
@@ -246,7 +344,7 @@ func run(ctx context.Context, region string) error {
 			if err := client.startEnvironment(ctx, env.EnvironmentID); err != nil {
 				return fmt.Errorf("start: %w", err)
 			}
-		} else {
+		} else if status != "" {
 			fmt.Fprintf(os.Stderr, "Environment status: %s, waiting...\n", status)
 		}
 
@@ -272,9 +370,13 @@ func run(ctx context.Context, region string) error {
 	}
 	defer client.deleteSession(context.Background(), env.EnvironmentID, sess.SessionID)
 
-	fmt.Fprintf(os.Stderr, "Connected.\n\n")
+	if isVPC {
+		fmt.Fprintf(os.Stderr, "Connected to VPC environment.\n\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "Connected.\n\n")
+	}
 
-	// Start heartbeat in background
+	// Heartbeat to keep environment alive
 	go func() {
 		ticker := time.NewTicker(4 * time.Minute)
 		defer ticker.Stop()
@@ -288,20 +390,19 @@ func run(ctx context.Context, region string) error {
 		}
 	}()
 
-	// Launch session-manager-plugin with stdin/stdout/stderr connected directly
+	// Launch session-manager-plugin with terminal connected directly
 	payload, _ := json.Marshal(map[string]string{
 		"SessionId":  sess.SessionID,
 		"TokenValue": sess.TokenValue,
 		"StreamUrl":  sess.StreamURL,
 	})
 
-	cmd := exec.CommandContext(ctx, "session-manager-plugin", string(payload), region, "StartSession")
+	cmd := exec.CommandContext(ctx, "session-manager-plugin", string(payload), f.region, "StartSession")
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
-		// Don't report error if user hit Ctrl+C
 		if ctx.Err() != nil {
 			return nil
 		}
