@@ -141,9 +141,12 @@ func (c *csClient) describeEnvironments(ctx context.Context) (*describeOutput, e
 	return &out, err
 }
 
-func (c *csClient) createEnvironment(ctx context.Context, vpc *vpcConfig) (*environment, error) {
+func (c *csClient) createEnvironment(ctx context.Context, name string, vpc *vpcConfig) (*environment, error) {
 	var out environment
 	payload := map[string]any{}
+	if name != "" {
+		payload["EnvironmentName"] = name
+	}
 	if vpc != nil {
 		payload["VpcConfig"] = vpc
 	}
@@ -288,7 +291,7 @@ func run(ctx context.Context, f flags) error {
 			SubnetIDs:        []string{f.subnet},
 			SecurityGroupIDs: f.sg,
 		}
-		created, err := client.createEnvironment(ctx, vpc)
+		created, err := client.createEnvironment(ctx, fmt.Sprintf("cloudshell-term-vpc-%s", f.vpc), vpc)
 		if err != nil {
 			return fmt.Errorf("create VPC environment: %w", err)
 		}
@@ -303,7 +306,7 @@ func run(ctx context.Context, f flags) error {
 
 		if len(envs.Environments) == 0 {
 			fmt.Fprintf(os.Stderr, "No environment found, creating...\n")
-			created, err := client.createEnvironment(ctx, nil)
+			created, err := client.createEnvironment(ctx, "", nil)
 			if err != nil {
 				return fmt.Errorf("create environment: %w", err)
 			}
@@ -320,7 +323,7 @@ func run(ctx context.Context, f flags) error {
 			}
 			if !found {
 				fmt.Fprintf(os.Stderr, "No standard environment found, creating...\n")
-				created, err := client.createEnvironment(ctx, nil)
+				created, err := client.createEnvironment(ctx, "", nil)
 				if err != nil {
 					return fmt.Errorf("create environment: %w", err)
 				}
