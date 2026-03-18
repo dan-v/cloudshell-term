@@ -393,22 +393,28 @@ func run(ctx context.Context, f flags) error {
 		}
 	}()
 
-	// Launch session-manager-plugin for interactive TTY
+	// Launch session-manager-plugin for interactive TTY.
+	// Ignore SIGINT so Ctrl+C passes through to the remote shell
+	// via the plugin instead of killing our process.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTSTP)
+	go func() {
+		for range sigCh {
+		}
+	}()
+
 	payload, _ := json.Marshal(map[string]string{
 		"SessionId":  sess.SessionID,
 		"TokenValue": sess.TokenValue,
 		"StreamUrl":  sess.StreamURL,
 	})
 
-	cmd := exec.CommandContext(ctx, "session-manager-plugin", string(payload), f.region, "StartSession")
+	cmd := exec.Command("session-manager-plugin", string(payload), f.region, "StartSession")
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return nil
-		}
 		return fmt.Errorf("session-manager-plugin: %w", err)
 	}
 
